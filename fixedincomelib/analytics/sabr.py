@@ -140,8 +140,15 @@ class SABRAnalytics:
         alpha = sigma_atm_lognormal * (forward + shift) ** (1.0 - beta)
         for _ in range(max_iter):
             # implement your newton step here to update alpha
-            pass
-
+            this_res = SABRAnalytics.lognormal_vol_from_alpha(
+                forward, forward, time_to_expiry, alpha, beta, rho, nu, shift, calc_risk=True
+            )
+            vol = this_res[SimpleMetrics.IMPLIED_LOG_NORMAL_VOL]
+            diff = vol - sigma_atm_lognormal
+            if abs(diff) < tol:
+                break
+            dvol_dalpha = this_res[SabrMetrics.D_LN_SIGMA_D_ALPHA]
+            alpha = alpha - diff / dvol_dalpha
         else:
             raise RuntimeError("alpha_from_atm_lognormal_sigma: Newton did not converge")
 
@@ -155,8 +162,15 @@ class SABRAnalytics:
             # using implicit function theorem
             # df/dalpha * dalpha/dln_sigma = 1 =>             dalpha / dln_sigma = 1 / df/dalpha
             # df/dalpha * dalpha/dtheta  + df/dtheta = 0 =>  dalpha / dtheta = - df/dtheta / df/dalpha
+            dvol_dalpha = this_res[SabrMetrics.D_LN_SIGMA_D_ALPHA]
+            res[SabrMetrics.D_ALPHA_D_LN_SIGMA_ATM] = 1.0 / dvol_dalpha
+            res[SabrMetrics.D_ALPHA_D_FORWARD] = -this_res[SabrMetrics.D_LN_SIGMA_D_FORWARD] / dvol_dalpha
+            res[SabrMetrics.D_ALPHA_D_TTE] = -this_res[SabrMetrics.D_LN_SIGMA_D_TTE] / dvol_dalpha
+            res[SabrMetrics.D_ALPHA_D_BETA] = -this_res[SabrMetrics.D_LN_SIGMA_D_BETA] / dvol_dalpha
+            res[SabrMetrics.D_ALPHA_D_NU] = -this_res[SabrMetrics.D_LN_SIGMA_D_NU] / dvol_dalpha
+            res[SabrMetrics.D_ALPHA_D_RHO] = -this_res[SabrMetrics.D_LN_SIGMA_D_RHO] / dvol_dalpha
 
-            return res
+        return res
 
     # conversion to alpha from normal atm vol
     @staticmethod
@@ -179,10 +193,40 @@ class SABRAnalytics:
         # compute implied log normal vol
 
         # risk aggregation
-        final_res = {}
+        pv_res = EuropeanOptionAnalytics.european_option_normal(
+            forward + shift, forward + shift, time_to_expiry, sigma_atm_normal, CallOrPut.CALL, calc_risk
+        )
+        pv = pv_res[SimpleMetrics.PV]
+        
+        ln_res = EuropeanOptionAnalytics.implied_lognormal_vol_sensitivities(
+            pv, forward + shift, forward + shift, time_to_expiry, CallOrPut.CALL, calc_risk, tol
+        )
+        sigma_atm_lognormal = ln_res[SimpleMetrics.IMPLIED_LOG_NORMAL_VOL]
+
+        alpha_res = SABRAnalytics.alpha_from_atm_lognormal_sigma(
+            forward, time_to_expiry, sigma_atm_lognormal, beta, rho, nu, shift, calc_risk, max_iter, tol
+        )
+
+        # risk aggregation
+        final_res = {SabrMetrics.ALPHA: alpha_res[SabrMetrics.ALPHA]}
 
         if calc_risk:
-            pass
+            vega_n = pv_res[SimpleMetrics.VEGA]
+            
+            bs_res = EuropeanOptionAnalytics.european_option_log_normal(
+                forward + shift, forward + shift, time_to_expiry, sigma_atm_lognormal, CallOrPut.CALL, True
+            )
+            vega_ln = bs_res[SimpleMetrics.VEGA]
+            d_ln_d_n = vega_n / vega_ln
+            
+            final_res[SabrMetrics.D_ALPHA_D_NORMAL_SIGMA_ATM] = alpha_res[SabrMetrics.D_ALPHA_D_LN_SIGMA_ATM] * d_ln_d_n
+            final_res[SabrMetrics.D_ALPHA_D_BETA] = alpha_res[SabrMetrics.D_ALPHA_D_BETA]
+            final_res[SabrMetrics.D_ALPHA_D_RHO] = alpha_res[SabrMetrics.D_ALPHA_D_RHO]
+            final_res[SabrMetrics.D_ALPHA_D_NU] = alpha_res[SabrMetrics.D_ALPHA_D_NU]
+            
+            final_res[SabrMetrics.D_ALPHA_D_FORWARD] = alpha_res[SabrMetrics.D_ALPHA_D_FORWARD] + alpha_res[SabrMetrics.D_ALPHA_D_LN_SIGMA_ATM] * (ln_res.get(SimpleMetrics.D_LN_VOL_D_FORWARD, 0.0) + ln_res.get(SimpleMetrics.D_LN_VOL_D_STRIKE, 0.0) + d_ln_d_n * (pv_res.get(SimpleMetrics.DELTA, 0.0) + pv_res.get(SimpleMetrics.STRIKE_RISK, 0.0)))
+            
+            final_res[SabrMetrics.D_ALPHA_D_TTE] = alpha_res[SabrMetrics.D_ALPHA_D_TTE] + alpha_res[SabrMetrics.D_ALPHA_D_LN_SIGMA_ATM] * (ln_res.get(SimpleMetrics.D_LN_VOL_D_TTE, 0.0) + d_ln_d_n * pv_res.get(SimpleMetrics.TTE_RISK, 0.0))
 
         return final_res
 
@@ -406,17 +450,52 @@ class SABRAnalytics:
         """
         value_and_sensitivities = {}
         ### pv
+        alpha_res = SABRAnalytics.alpha_from_atm_normal_sigma(
+            forward, time_to_expiry, normal_sigma_atm, beta, rho, nu, shift, calc_risk
+        )
+        alpha = alpha_res[SabrMetrics.ALPHA]
+        
+        value_and_sensitivities = SABRAnalytics.european_option_alpha(
+            forward, strike, time_to_expiry, opt_type, alpha, beta, rho, nu, shift, calc_risk
+        )
 
         ### risk
         if calc_risk:
             ## first order risks
+            dvdalpha = value_and_sensitivities[SabrMetrics.DALPHA]
+            value_and_sensitivities.pop(SabrMetrics.DALPHA)
+
+            value_and_sensitivities[SimpleMetrics.DELTA] += dvdalpha * alpha_res.get(SabrMetrics.D_ALPHA_D_FORWARD, 0.0)
+            value_and_sensitivities[SimpleMetrics.THETA] -= dvdalpha * alpha_res.get(SabrMetrics.D_ALPHA_D_TTE, 0.0)
+            value_and_sensitivities[SabrMetrics.DNORMALSIGMA] = dvdalpha * alpha_res.get(SabrMetrics.D_ALPHA_D_NORMAL_SIGMA_ATM, 0.0)
 
             # sabr beta/rho/nu
+            for key, risk in [
+                (SabrMetrics.DBETA, SabrMetrics.D_ALPHA_D_BETA),
+                (SabrMetrics.DRHO, SabrMetrics.D_ALPHA_D_RHO),
+                (SabrMetrics.DNU, SabrMetrics.D_ALPHA_D_NU),
+            ]:
+                value_and_sensitivities[key] += dvdalpha * alpha_res.get(risk, 0.0)
 
             # second order risk (bump reval)
+            v_base = value_and_sensitivities[SimpleMetrics.PV]
 
             # gamma
-            pass
+            res_up = SABRAnalytics.alpha_from_atm_normal_sigma(
+                forward + SABRAnalytics.EPSILON, time_to_expiry, normal_sigma_atm, beta, rho, nu, shift
+            )
+            v_up = SABRAnalytics.european_option_alpha(
+                forward + SABRAnalytics.EPSILON, strike, time_to_expiry, opt_type, res_up[SabrMetrics.ALPHA], beta, rho, nu, shift
+            )[SimpleMetrics.PV]
+
+            res_dn = SABRAnalytics.alpha_from_atm_normal_sigma(
+                forward - SABRAnalytics.EPSILON, time_to_expiry, normal_sigma_atm, beta, rho, nu, shift
+            )
+            v_dn = SABRAnalytics.european_option_alpha(
+                forward - SABRAnalytics.EPSILON, strike, time_to_expiry, opt_type, res_dn[SabrMetrics.ALPHA], beta, rho, nu, shift
+            )[SimpleMetrics.PV]
+
+            value_and_sensitivities[SimpleMetrics.GAMMA] = (v_up - 2 * v_base + v_dn) / (SABRAnalytics.EPSILON**2)
 
         return value_and_sensitivities
 
@@ -585,28 +664,127 @@ class SABRAnalytics:
         fk = (F * K) ** ((1 - b) / 2)
         greeks: Dict[SabrMetrics, float] = {}
 
+        # FIX: compute the missing w1 and w2 components
+        w1 = 1.0 + ((1.0 - b)**2 / 24.0) * (log_FK**2) + ((1.0 - b)**4 / 1920.0) * (log_FK**4)
+        w2 = ((1.0 - b)**2 / 24.0) * (a**2 / fk**2) + (0.25 * r * b * n * a / fk) + ((2.0 - 3.0 * r**2) / 24.0) * (n**2)
+
         z = n / a * log_FK * fk
 
         if abs(z) < z_cut:
             # expansion when z is small
-            # calculate vol and risk, you can use the helper functions above w2_risk, w1_risk, z_risk, x_risk, C_risk
-            # to get the risk for each component and then aggregate them to get the risk for vol
-            sigma = 0.0
+            C = 1.0 - 0.5*r*z + (1.0/6.0 - r**2/4.0)*z**2 - (0.25*r**2 - 5.0/24.0)*r*z**3 + (1.0/3.0*r**2 - 17.0/360.0 - 5.0/16.0*r**4)*z**4 - (7.0/16.0*r**4 - 55.0/96.0*r**2 + 37.0/240.0)*r*z**5
+            sigma = (a / (fk * w1)) * C * (1.0 + w2 * T)
 
             if calc_risk:
+                w1_r = SABRAnalytics.w1_risk(F, K, T, a, b, r, n)
+                w2_r = SABRAnalytics.w2_risk(F, K, T, a, b, r, n)
+                C_r = SABRAnalytics.C_risk(F, K, T, a, b, r, n)
+                
+                fk_risk = {
+                    SabrMetrics.DALPHA: 0.0,
+                    SabrMetrics.DBETA: -0.5 * np.log(F * K) * fk,
+                    SabrMetrics.DRHO: 0.0,
+                    SabrMetrics.DNU: 0.0,
+                    SabrMetrics.DFORWARD: 0.5 * (1.0 - b) * fk / F,
+                    SabrMetrics.DSTRIKE: 0.5 * (1.0 - b) * fk / K,
+                    SabrMetrics.DSTRIKESTRIKE: 0.5 * (1.0 - b) * (0.5 * (1.0 - b) - 1.0) * fk / (K**2)
+                }
 
-                pass
+                map_keys = {
+                    SabrMetrics.DALPHA: SabrMetrics.D_LN_SIGMA_D_ALPHA,
+                    SabrMetrics.DBETA: SabrMetrics.D_LN_SIGMA_D_BETA,
+                    SabrMetrics.DRHO: SabrMetrics.D_LN_SIGMA_D_RHO,
+                    SabrMetrics.DNU: SabrMetrics.D_LN_SIGMA_D_NU,
+                    SabrMetrics.DFORWARD: SabrMetrics.D_LN_SIGMA_D_FORWARD,
+                    SabrMetrics.DSTRIKE: SabrMetrics.D_LN_SIGMA_D_STRIKE,
+                }
+                
+                d_ln_sigma_d_K = 0.0
+                for k_in, k_out in map_keys.items():
+                    d_ln = 0.0
+                    if k_in == SabrMetrics.DALPHA: d_ln += 1.0 / a
+                    d_ln -= fk_risk[k_in] / fk
+                    d_ln -= w1_r[k_in] / w1
+                    d_ln += C_r[k_in] / C
+                    d_ln += w2_r[k_in] * T / (1.0 + w2 * T)
+                    
+                    greeks[k_out] = sigma * d_ln
+                    if k_in == SabrMetrics.DSTRIKE:
+                        d_ln_sigma_d_K = d_ln
+                        
+                d2_ln = 0.0
+                d2_ln -= (fk_risk[SabrMetrics.DSTRIKESTRIKE]/fk - (fk_risk[SabrMetrics.DSTRIKE]/fk)**2)
+                d2_ln -= (w1_r[SabrMetrics.DSTRIKESTRIKE]/w1 - (w1_r[SabrMetrics.DSTRIKE]/w1)**2)
+                d2_ln += (C_r[SabrMetrics.DSTRIKESTRIKE]/C - (C_r[SabrMetrics.DSTRIKE]/C)**2)
+                w2_T = 1.0 + w2 * T
+                d2_ln += T * (w2_r[SabrMetrics.DSTRIKESTRIKE] * w2_T - w2_r[SabrMetrics.DSTRIKE]**2 * T) / (w2_T**2)
+                greeks[SabrMetrics.D_LN_SIGMA_D_STRIKESTRIKE] = greeks[SabrMetrics.D_LN_SIGMA_D_STRIKE] * d_ln_sigma_d_K + sigma * d2_ln
+                greeks[SabrMetrics.D_LN_SIGMA_D_TTE] = sigma * w2 / (1.0 + w2 * T)
 
             return sigma, greeks
 
         # raw SABR
-        sigma = 0.0
+        x = np.log((np.sqrt(1.0 - 2.0*r*z + z**2) + z - r) / (1.0 - r))
+        C = z / x
+        sigma = (a / (fk * w1)) * C * (1.0 + w2 * T)
 
         if calc_risk:
             # calculate risk for z, w1, w2, x
-            pass
+            w1_r = SABRAnalytics.w1_risk(F, K, T, a, b, r, n)
+            w2_r = SABRAnalytics.w2_risk(F, K, T, a, b, r, n)
+            x_r = SABRAnalytics.x_risk(F, K, T, a, b, r, n)
+            z_r = SABRAnalytics.z_risk(F, K, T, a, b, r, n)
+            
+            C_r = {}
+            for k_risk in [SabrMetrics.DALPHA, SabrMetrics.DBETA, SabrMetrics.DRHO, SabrMetrics.DNU, SabrMetrics.DFORWARD, SabrMetrics.DSTRIKE]:
+                C_r[k_risk] = (z_r[k_risk] * x - z * x_r[k_risk]) / (x**2)
+            
+            C_r[SabrMetrics.DSTRIKESTRIKE] = (z_r[SabrMetrics.DSTRIKESTRIKE] * x - z * x_r[SabrMetrics.DSTRIKESTRIKE]) / (x**2) - 2.0 * x_r[SabrMetrics.DSTRIKE] * (z_r[SabrMetrics.DSTRIKE] * x - z * x_r[SabrMetrics.DSTRIKE]) / (x**3)
+
+            fk_risk = {
+                SabrMetrics.DALPHA: 0.0,
+                SabrMetrics.DBETA: -0.5 * np.log(F * K) * fk,
+                SabrMetrics.DRHO: 0.0,
+                SabrMetrics.DNU: 0.0,
+                SabrMetrics.DFORWARD: 0.5 * (1.0 - b) * fk / F,
+                SabrMetrics.DSTRIKE: 0.5 * (1.0 - b) * fk / K,
+                SabrMetrics.DSTRIKESTRIKE: 0.5 * (1.0 - b) * (0.5 * (1.0 - b) - 1.0) * fk / (K**2)
+            }
+
+            map_keys = {
+                SabrMetrics.DALPHA: SabrMetrics.D_LN_SIGMA_D_ALPHA,
+                SabrMetrics.DBETA: SabrMetrics.D_LN_SIGMA_D_BETA,
+                SabrMetrics.DRHO: SabrMetrics.D_LN_SIGMA_D_RHO,
+                SabrMetrics.DNU: SabrMetrics.D_LN_SIGMA_D_NU,
+                SabrMetrics.DFORWARD: SabrMetrics.D_LN_SIGMA_D_FORWARD,
+                SabrMetrics.DSTRIKE: SabrMetrics.D_LN_SIGMA_D_STRIKE,
+            }
+            
+            d_ln_sigma_d_K = 0.0
+            for k_in, k_out in map_keys.items():
+                d_ln = 0.0
+                if k_in == SabrMetrics.DALPHA: d_ln += 1.0 / a
+                d_ln -= fk_risk[k_in] / fk
+                d_ln -= w1_r[k_in] / w1
+                d_ln += C_r[k_in] / C
+                d_ln += w2_r[k_in] * T / (1.0 + w2 * T)
+                
+                greeks[k_out] = sigma * d_ln
+                if k_in == SabrMetrics.DSTRIKE:
+                    d_ln_sigma_d_K = d_ln
+                    
+            d2_ln = 0.0
+            d2_ln -= (fk_risk[SabrMetrics.DSTRIKESTRIKE]/fk - (fk_risk[SabrMetrics.DSTRIKE]/fk)**2)
+            d2_ln -= (w1_r[SabrMetrics.DSTRIKESTRIKE]/w1 - (w1_r[SabrMetrics.DSTRIKE]/w1)**2)
+            d2_ln += (C_r[SabrMetrics.DSTRIKESTRIKE]/C - (C_r[SabrMetrics.DSTRIKE]/C)**2)
+            w2_T = 1.0 + w2 * T
+            d2_ln += T * (w2_r[SabrMetrics.DSTRIKESTRIKE] * w2_T - w2_r[SabrMetrics.DSTRIKE]**2 * T) / (w2_T**2)
+            greeks[SabrMetrics.D_LN_SIGMA_D_STRIKESTRIKE] = greeks[SabrMetrics.D_LN_SIGMA_D_STRIKE] * d_ln_sigma_d_K + sigma * d2_ln
+            greeks[SabrMetrics.D_LN_SIGMA_D_TTE] = sigma * w2 / (1.0 + w2 * T)
 
         return sigma, greeks
+        
+        
 
 
  ### optional: if you want to calculate analytical pdf and cdf of the SABR model
